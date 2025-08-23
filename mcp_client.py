@@ -1,6 +1,6 @@
 import socket
 
-def send_request(message, host='127.0.0.1', port=5000):
+def send_request(message, host='127.0.0.1', port=8888):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((host, port))
         s.sendall(message.encode())
