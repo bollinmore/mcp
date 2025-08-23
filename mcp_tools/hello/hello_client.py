@@ -154,14 +154,14 @@ def main() -> int:
 
         # 1) Discover tools
         tools = client.request("tools/list")
-        print("Discovered tools:", tools)
+        print("Discovered tools:\n", json.dumps(tools, ensure_ascii=False, indent=2))
 
         # 2) Call hello tool
         call_result = client.request(
             "tools/call",
             params={"name": "hello", "arguments": {"message": args.message}},
         )
-        print("Call result:", call_result)
+        print("Call result:", json.dumps(call_result, ensure_ascii=False, indent=2))
         return 0
     finally:
         graceful_shutdown(proc)
