@@ -1,15 +1,13 @@
 import argparse
 import json
 import os
-import signal
 import subprocess
 import sys
-import time
 from typing import Any, Dict
 from pathlib import Path
 
 # ------------------------------
-# Optional: Local LLM (Ollama) integration
+# Required: Local LLM (Ollama) integration
 # ------------------------------
 try:
     import ollama  # Make sure you do NOT have a local file named "ollama.py"
@@ -90,58 +88,19 @@ def plan_with_ollama_timeout(user_text: str, model: str = "llama3.1", timeout: f
     return result
 
 
-def naive_plan(user_text: str) -> Dict[str, Any]:
-    """Fallback planner without LLM, minimal heuristics.
-    - If the text mentions 'hello', target 'hello' and try to extract a name after 'to '.
-    - Otherwise route to 'inspector' with no args as a safe default.
-    """
-    txt = (user_text or "").strip()
-    low = txt.lower()
-    if "hello" in low:
-        name = ""
-        # naive extraction: anything after ' to '
-        if " to " in low:
-            try:
-                after = txt[low.index(" to ") + 4 :].strip()
-                # take the last token if multiple words, else whole
-                name = after.split()[0] if after else ""
-            except Exception:
-                name = ""
-        args: Dict[str, Any] = {}
-        if name:
-            args["text"] = f"Hello, {name}!"
-        else:
-            args["text"] = "Hello!"
-        return {"intent": "say_hello", "target": "hello", "args": args}
-    if "git" in low:
-        # Very naive mapping: choose status if no verb found
-        action = "status"
-        if "diff" in low:
-            action = "diff"
-        elif "add" in low:
-            action = "add"
-        elif "commit" in low:
-            action = "commit"
-        elif "log" in low:
-            action = "log"
-        elif "branch" in low:
-            action = "branch"
-        elif "checkout" in low or "switch" in low:
-            action = "checkout"
-        args = {"cmd": action}
-        return {"intent": f"git_{action}", "target": "git", "args": args}
-    # default safe route
-    return {"intent": "inspect_env", "target": "inspector", "args": {}}
+def plan_with_ollama_required(user_text: str, model: str = "llama3.1", timeout: float = 20.0) -> Dict[str, Any]:
+    """Planner that *requires* Ollama. If Ollama is unavailable or planning fails, raise a clear error."""
+    if ollama is None:
+        hint = (
+            "\nHint: If you have a local file named 'ollama.py' or a '__pycache__/ollama*.pyc', "
+            "rename/delete it so it doesn't shadow the real package."
+        )
+        raise RuntimeError(
+            f"Ollama is required but not available: {_OLLAMA_IMPORT_ERROR}{hint}"
+        )
 
-
-def plan_auto(user_text: str, model: str = "llama3.1", timeout: float = 20.0) -> Dict[str, Any]:
-    """Best-effort planner: try Ollama with timeout, fall back to naive heuristic."""
-    if ollama is not None:
-        try:
-            return plan_with_ollama_timeout(user_text, model=model, timeout=timeout)
-        except Exception:
-            pass
-    return naive_plan(user_text)
+    # Use the timeout-protected planner; propagate any exceptions for clarity
+    return plan_with_ollama_timeout(user_text, model=model, timeout=timeout)
 
 
 def dispatch_stub(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -412,27 +371,6 @@ def ensure_discovered() -> None:
     if not TOOL_REGISTRY:
         discover_tools()
 
-# ------------------------------
-# Original behavior: launch server, then client
-# ------------------------------
-
-def launch_stack_and_run_client() -> int:
-    """Launch mcp_server.py, wait a moment, run mcp_client.py, then terminate server."""
-    server_process = subprocess.Popen([sys.executable, "mcp_server.py"])  # nosec B603
-    try:
-        time.sleep(1.0)  # give server time to come up
-        result = subprocess.run([sys.executable, "mcp_client.py"])  # nosec B603
-        return result.returncode
-    finally:
-        # Gracefully terminate server
-        try:
-            server_process.terminate()
-            try:
-                server_process.wait(timeout=3)
-            except Exception:
-                server_process.kill()
-        except Exception:
-            pass
 
 
 # ------------------------------
@@ -440,32 +378,20 @@ def launch_stack_and_run_client() -> int:
 # ------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="MCP Host with optional local LLM planning (Ollama)")
-    parser.add_argument(
-        "--plan",
-        help=(
-            "Run the Ollama planning example with the given USER_TEXT and print the JSON plan, "
-            "instead of launching server+client."
-        ),
-    )
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("OLLAMA_MODEL", "llama3.1"),
-        help="Ollama model name (default: %(default)s).",
-    )
+    parser = argparse.ArgumentParser(description="MCP Host with natural language planning via Ollama")
     args = parser.parse_args()
+
+    # Always require Ollama for NLP planning
+    if ollama is None:
+        raise RuntimeError("Ollama is required but not available. Please install the ollama package and ensure no local ollama.py shadows it.")
 
     ensure_discovered()
 
-    if args.plan:
-        plan = plan_auto(args.plan, model=args.model, timeout=20.0)
-        out = dispatch_stub(plan)
-        print(json.dumps(out, ensure_ascii=False, indent=2))
-        return
-
-    # Default: preserve original behavior
-    rc = launch_stack_and_run_client()
-    sys.exit(rc)
+    user_text = input("Enter your request: ")
+    plan = plan_with_ollama_required(user_text, model="llama3.1", timeout=20.0)
+    out = dispatch_stub(plan)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return
 
 
 if __name__ == "__main__":
