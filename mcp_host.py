@@ -24,7 +24,7 @@ SYS_PROMPT = (
 You are the MCP Host planner. Given a user prompt, extract a strict JSON plan:
 {
   "intent": "verb_noun",
-  "target": "one of: cve, pfcm, product_options, inspector, hello",
+  "target": "one of: cve, pfcm, product_options, inspector, hello, git",
   "args": {"k": "v"}
 }
 Only output the JSON object. No extra text.
@@ -113,6 +113,23 @@ def naive_plan(user_text: str) -> Dict[str, Any]:
         else:
             args["text"] = "Hello!"
         return {"intent": "say_hello", "target": "hello", "args": args}
+    if "git" in low:
+        # Very naive mapping: choose status if no verb found
+        action = "status"
+        if "diff" in low:
+            action = "diff"
+        elif "add" in low:
+            action = "add"
+        elif "commit" in low:
+            action = "commit"
+        elif "log" in low:
+            action = "log"
+        elif "branch" in low:
+            action = "branch"
+        elif "checkout" in low or "switch" in low:
+            action = "checkout"
+        args = {"cmd": action}
+        return {"intent": f"git_{action}", "target": "git", "args": args}
     # default safe route
     return {"intent": "inspect_env", "target": "inspector", "args": {}}
 
@@ -147,6 +164,10 @@ def dispatch_stub(plan: Dict[str, Any]) -> Dict[str, Any]:
         ensure_discovered()
         inv = TOOL_REGISTRY.get("hello")
         result = inv(args) if inv else {"ok": False, "error": "hello tool not found in registry"}
+    elif target == "git":
+        ensure_discovered()
+        inv = TOOL_REGISTRY.get("git")
+        result = inv(args) if inv else {"ok": False, "error": "git tool not found in registry"}
     else:
         result = {"status": "unsupported_target", "target": target}
 
@@ -233,6 +254,137 @@ def _make_hello_invoker(tool_dir: Path):
     return _invoke
 
 
+def _make_git_invoker(tool_dir: Path):
+    """Invoker for mcp_tools/git/git_client.py
+
+    Expected args (examples):
+      {"repo": ".", "cmd": "status"}
+      {"repo": ".", "cmd": "diff", "target": "main", "context_lines": 5}
+      {"repo": ".", "cmd": "add", "files": ["file1", "file2"]}
+      {"repo": ".", "cmd": "commit", "message": "feat: ..."}
+      {"repo": ".", "cmd": "log", "max_count": 5}
+      {"repo": ".", "cmd": "branch", "branch_type": "all", "contains": "<sha>"}
+      {"repo": ".", "cmd": "call", "tool": "git_status", "json": {}}
+    """
+    def _invoke(args: Dict[str, Any]) -> Dict[str, Any]:
+        timeout_sec = float(os.environ.get("MCP_TOOL_TIMEOUT", "20"))
+        repo = str(args.get("repo") or args.get("repo_path") or ".")
+        cmd = str(args.get("cmd") or "status")
+
+        # Locate python client
+        py_client = tool_dir / "git" / "git_client.py"
+        if not py_client.exists():
+            # Also support layout where this file is at mcp_tools/git/git_client.py and we're already in that dir
+            alt = tool_dir / "git_client.py"
+            py_client = alt if alt.exists() else py_client
+        if not py_client.exists():
+            return {"ok": False, "error": f"Git client not found at {py_client}"}
+
+        base = [sys.executable, str(py_client), "--repo", repo]
+
+        def run(argv: list[str]) -> Dict[str, Any]:
+            try:
+                proc = subprocess.run(base + argv, capture_output=True, text=True, timeout=timeout_sec)  # nosec B603
+                ok = proc.returncode == 0
+                out = proc.stdout.strip()
+                err = proc.stderr.strip()
+                parsed = None
+                try:
+                    parsed = json.loads(out) if out else None
+                except Exception:
+                    parsed = None
+                return {
+                    "ok": ok,
+                    "returncode": proc.returncode,
+                    "stdout": out,
+                    "stderr": err,
+                    "json": parsed,
+                    "command": base + argv,
+                    "timed_out": False,
+                    "timeout_sec": timeout_sec,
+                }
+            except subprocess.TimeoutExpired:
+                return {
+                    "ok": False,
+                    "error": f"timeout after {timeout_sec}s",
+                    "command": base + argv,
+                    "timed_out": True,
+                    "timeout_sec": timeout_sec,
+                }
+            except Exception as e:
+                return {"ok": False, "error": str(e), "command": base + argv}
+
+        # Map cmd to CLI
+        if cmd == "status":
+            return run(["status"])
+        if cmd == "diff-unstaged":
+            context = str(int(args.get("context_lines", 3)))
+            return run(["diff-unstaged", "--context-lines", context])
+        if cmd == "diff-staged":
+            context = str(int(args.get("context_lines", 3)))
+            return run(["diff-staged", "--context-lines", context])
+        if cmd == "diff":
+            target = str(args.get("target") or args.get("revision") or "HEAD")
+            context = str(int(args.get("context_lines", 3)))
+            return run(["diff", "--target", target, "--context-lines", context])
+        if cmd == "add":
+            files = args.get("files") or []
+            if not files:
+                return {"ok": False, "error": "'add' requires 'files' list"}
+            return run(["add", "--files", *map(str, files)])
+        if cmd == "reset":
+            return run(["reset"])
+        if cmd == "commit":
+            msg = str(args.get("message") or "")
+            if not msg:
+                return {"ok": False, "error": "'commit' requires 'message'"}
+            return run(["commit", "--message", msg])
+        if cmd == "log":
+            mc = str(int(args.get("max_count", 10)))
+            return run(["log", "--max-count", mc])
+        if cmd == "create-branch":
+            name = str(args.get("name") or args.get("branch_name") or "")
+            if not name:
+                return {"ok": False, "error": "'create-branch' requires 'name'"}
+            sp = args.get("start_point") or args.get("start-point")
+            argv = ["create-branch", "--name", name]
+            if sp:
+                argv += ["--start-point", str(sp)]
+            return run(argv)
+        if cmd == "checkout":
+            name = str(args.get("name") or args.get("branch_name") or "")
+            if not name:
+                return {"ok": False, "error": "'checkout' requires 'name'"}
+            return run(["checkout", "--name", name])
+        if cmd == "show":
+            rev = str(args.get("revision") or "HEAD")
+            return run(["show", "--revision", rev])
+        if cmd == "init":
+            return run(["init"])
+        if cmd == "branch":
+            bt = str(args.get("branch_type") or "local")
+            contains = args.get("contains")
+            not_contains = args.get("not_contains")
+            argv = ["branch", "--type", bt]
+            if contains:
+                argv += ["--contains", str(contains)]
+            if not_contains:
+                argv += ["--not-contains", str(not_contains)]
+            return run(argv)
+        if cmd == "call":
+            tool = str(args.get("tool") or "")
+            payload = args.get("json") or {}
+            try:
+                payload_json = json.dumps(payload, ensure_ascii=False)
+            except Exception as e:
+                return {"ok": False, "error": f"invalid json payload: {e}"}
+            return run(["call", "--tool", tool, "--json", payload_json])
+
+        return {"ok": False, "error": f"unsupported git cmd: {cmd}"}
+
+    return _invoke
+
+
 def discover_tools() -> None:
     """Discover available MCP tools under ./mcp_tools/* and register invokers.
 
@@ -248,6 +400,12 @@ def discover_tools() -> None:
     hello_dir = tools_root / "hello"
     if hello_dir.exists() and hello_dir.is_dir():
         TOOL_REGISTRY["hello"] = _make_hello_invoker(hello_dir)
+
+    # Discover 'git' tool
+    git_dir = tools_root / "git"
+    if git_dir.exists():
+        # Support both layouts: mcp_tools/git/git_client.py or mcp_tools/git/git/git_client.py
+        TOOL_REGISTRY["git"] = _make_git_invoker(tools_root)
 
 
 def ensure_discovered() -> None:
