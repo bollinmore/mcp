@@ -1,185 +1,164 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hello MCP **server** that responds to hello_client.py.
-- Implements stdio JSON-RPC protocol.
-- Supports initialize, tools/list, tools/call.
+LLM-driven MCP **client** that connects to the local hello_server.py via stdio,
+lists tools, asks an LLM which tool(s) to call, then invokes them.
+
+Adapted from:
+https://raw.githubusercontent.com/microsoft/mcp-for-beginners/refs/heads/main/03-GettingStarted/03-llm-client/solution/python/client.py
 """
 
+import os
 import sys
 import json
-import time
-import subprocess
-from typing import Any, Dict, Optional
+import asyncio
 from pathlib import Path
 
-JSON = Dict[str, Any]
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from dotenv import load_dotenv
+
+# Load environment variables from .env file if present
+load_dotenv()
+
+# --- LLM (Azure AI Inference) ---
+# The reference sample uses Azure AI Inference with the endpoint
+#   https://models.inference.ai.azure.com
+# and model "gpt-4o". You must export GITHUB_TOKEN (classic PAT) as your key.
+try:
+    from azure.ai.inference import ChatCompletionsClient
+    from azure.core.credentials import AzureKeyCredential
+except Exception as _e:  # pragma: no cover
+    ChatCompletionsClient = None  # type: ignore
+    AzureKeyCredential = None  # type: ignore
 
 
-def write_json(obj: JSON) -> None:
-    print(json.dumps(obj, ensure_ascii=False), flush=True)
-
-
-def handle_initialize(req_id: Any, params: Optional[JSON]) -> None:
-    write_json({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {
-            "serverInfo": {"name": "HelloServer", "version": "1.0.0"},
-            "capabilities": {},
-            "protocolVersion": "2025-06-18",
-        },
-    })
-
-
-def handle_tools_list(req_id: Any) -> None:
-    write_json({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {
-            "tools": [
-                {"name": "hello", "description": "Say hello"},
-            ],
-            "nextCursor": None,
-        },
-    })
-
-
-def handle_tools_call(req_id: Any, params: Optional[JSON]) -> None:
-    name = params.get("name") if params else None
-    arguments = params.get("arguments") if params else {}
-    if name == "hello":
-        message = arguments.get("message", "Hello!")
-        write_json({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {"response": f"Hello from server! You said: {message}"},
-        })
-    else:
-        write_json({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32602, "message": f"Unknown tool: {name}"},
-        })
-
-
-def handle_prompts_list(req_id: Any, params: Optional[JSON]) -> None:
-    write_json({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {
-            "prompts": [],
-            "nextCursor": None
-        }
-    })
-
-
-def handle_resources_list(req_id: Any, params: Optional[JSON]) -> None:
-    write_json({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {
-            "resources": [],
-            "nextCursor": None
-        }
-    })
-
-
-def handle_resources_templates_list(req_id: Any, params: Optional[JSON]) -> None:
-    write_json({
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "result": {
-            "resourceTemplates": [],
-            "nextCursor": None
-        }
-    })
-
-def launch_server() -> subprocess.Popen:
-    """Launch hello_server.py as a stdio JSON-RPC server and return the Popen."""
+def _hello_server_params() -> StdioServerParameters:
+    """Create server parameters to launch hello_server.py over stdio."""
     here = Path(__file__).resolve().parent
     server_py = here / "hello_server.py"
     if not server_py.exists():
-        print(f"[hello_client] ERROR: {server_py} not found.", file=sys.stderr)
-        sys.exit(2)
+        raise FileNotFoundError(f"hello_server.py not found at {server_py}")
 
-    cmd = [sys.executable, str(server_py), "--verbose"]
-    # Launch server over stdio; keep pipes to allow health checks / diagnostics
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+    # Launch the Python server via stdio
+    return StdioServerParameters(
+        command=sys.executable,
+        args=[str(server_py), "--verbose"],
+        env=None,
     )
-    return proc
 
-def main() -> int:
-    proc = launch_server()
+
+def call_llm(prompt: str, functions: list[dict]) -> list[dict]:
+    """Call the LLM with a prompt + tool schemas, return tool call plan.
+
+    Returns a list like: [{"name": <tool_name>, "args": {...}}, ...]
+    """
+    if ChatCompletionsClient is None or AzureKeyCredential is None:
+        raise RuntimeError(
+            "azure.ai.inference is not installed. Install 'azure-ai-inference' to run this sample."
+        )
+
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "GITHUB_TOKEN is not set. Export a GitHub token to use Azure AI Inference."
+        )
+
+    endpoint = "https://models.inference.ai.azure.com"
+    model_name = "gpt-4o"
+
+    client = ChatCompletionsClient(
+        endpoint=endpoint,
+        credential=AzureKeyCredential(token),
+    )
+
+    # NOTE: We pass the tool/function schema using the `tools` parameter.
+    print("[llm] calling model to plan tool calls…", file=sys.stderr)
+    response = client.complete(
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that decides which tool to call."},
+            {"role": "user", "content": prompt},
+        ],
+        model=model_name,
+        tools=functions,
+        temperature=0,
+        max_tokens=512,
+        top_p=1,
+    )
+
+    message = response.choices[0].message
+    planned: list[dict] = []
+    if getattr(message, "tool_calls", None):
+        for tool_call in message.tool_calls:
+            name = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments)
+            except Exception:
+                args = {}
+            planned.append({"name": name, "args": args})
+            print(f"[llm] planned tool: {name} args={args}", file=sys.stderr)
+    else:
+        print("[llm] no tool calls suggested", file=sys.stderr)
+    return planned
+
+
+def convert_to_llm_tool(tool) -> dict:
+    """Convert an MCP Tool (from list_tools) into an OpenAI/Azure 'tool' schema."""
+    # Be defensive in case the server omits input schema
+    props = {}
     try:
-        # small delay to let server boot (stdio listeners set up)
-        time.sleep(0.1)
-        if proc.poll() is not None:
-            err_out = ""
-            try:
-                if proc.stderr is not None:
-                    err_out = (proc.stderr.read() or "").strip()
-            except Exception:
-                pass
-            print(f"[hello_client] Server failed to start. Stderr:\n{err_out}", file=sys.stderr)
-            return 2
-        print("[hello_client] hello_server launched (pid=%s)" % proc.pid, file=sys.stderr)
-        
-        while True:
-            line = sys.stdin.readline()
-            if not line:
-                break
-            try:
-                req = json.loads(line)
-            except Exception:
-                # Ignore malformed input
-                continue
+        props = tool.inputSchema["properties"]  # type: ignore[index]
+    except Exception:
+        props = {}
 
-            req_id = req.get("id")
-            method = req.get("method")
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": getattr(tool, "description", ""),
+            "type": "function",
+            "parameters": {
+                "type": "object",
+                "properties": props,
+            },
+        },
+    }
 
-            # Notifications have no "id": do not respond (per JSON-RPC) and do not error
-            if req_id is None:
-                if method == "notifications/initialized" or (isinstance(method, str) and method.startswith("notifications/")):
-                    continue  # silently accept/ignore notifications
-                else:
-                    continue  # ignore any other notifications as well
 
-            params = req.get("params")
+async def run() -> None:
+    # Connect to our hello_server.py via stdio
+    server_params = _hello_server_params()
 
-            if method == "initialize":
-                handle_initialize(req_id, params)
-            elif method == "tools/list":
-                handle_tools_list(req_id)
-            elif method == "tools/call":
-                handle_tools_call(req_id, params)
-            elif method == "prompts/list":
-                handle_prompts_list(req_id, params)
-            elif method == "resources/list":
-                handle_resources_list(req_id, params)
-            elif method == "resources/templates/list":
-                handle_resources_templates_list(req_id, params)
-            else:
-                write_json({
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32601, "message": f"Unknown method: {method}"}
-                })
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            # Initialize the connection
+            await session.initialize()
 
-        return 0
+            # (Optional) List available resources
+            resources = await session.list_resources()
+            for r in resources:
+                print(f"[mcp] resource: {r}")
 
-    finally:
-        try:
-            if proc and proc.poll() is None:
-                proc.terminate()
-        except Exception:
-            pass
+            # List available tools and convert to LLM tool schema
+            tools = await session.list_tools()
+            functions: list[dict] = []
+            for t in tools.tools:
+                print(f"[mcp] tool: {t.name}")
+                functions.append(convert_to_llm_tool(t))
+
+            # Example prompt that should trigger the hello tool
+            # Adjust wording as your hello_server expects (e.g., expects an arg `message`).
+            prompt = "Say hello to 'Alvin' using the hello tool with message='Hi from LLM client'."
+
+            plan = call_llm(prompt, functions)
+
+            # Execute planned tool calls
+            for step in plan:
+                name = step.get("name")
+                args = step.get("args", {})
+                result = await session.call_tool(name, arguments=args)
+                print("[mcp] tool result:", result.content)
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    asyncio.run(run())
