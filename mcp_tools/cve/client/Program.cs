@@ -15,28 +15,21 @@ using ModelContextProtocol.Client;
 static void TrimHistory(List<ChatMessage> msgs, int maxHistory)
 {
     if (msgs.Count > maxHistory)
-    {
         msgs.RemoveRange(0, msgs.Count - maxHistory);
-    }
 }
 
 static object? GetProp(object obj, string name)
 {
     var t = obj.GetType();
-    // 先找屬性 (PascalCase / camelCase)
     var p = t.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
     if (p != null) return p.GetValue(obj);
-
-    // 找欄位
     var f = t.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase);
     if (f != null) return f.GetValue(obj);
-
     return null;
 }
 
 static string ToolSchemaToString(object tool)
 {
-    // 常見名稱：input_schema / parameters / schema
     var candidates = new[] { "InputSchema", "input_schema", "Parameters", "parameters", "Schema", "schema" };
     foreach (var n in candidates)
     {
@@ -45,14 +38,8 @@ static string ToolSchemaToString(object tool)
         {
             try
             {
-                if (v is JsonNode node)
-                {
-                    return node.ToJsonString(new JsonSerializerOptions { WriteIndented = false, MaxDepth = 256 });
-                }
-                if (v is JsonElement je)
-                {
-                    return je.GetRawText();
-                }
+                if (v is JsonNode node) return node.ToJsonString(new JsonSerializerOptions { WriteIndented = false, MaxDepth = 256 });
+                if (v is JsonElement je) return je.GetRawText();
                 return JsonSerializer.Serialize(v, new JsonSerializerOptions { WriteIndented = false, MaxDepth = 256 });
             }
             catch
@@ -61,8 +48,6 @@ static string ToolSchemaToString(object tool)
             }
         }
     }
-
-    // 找不到就保守序列化整個 tool（可能很大，必要時你可截斷）
     try
     {
         return JsonSerializer.Serialize(tool, new JsonSerializerOptions { WriteIndented = false, MaxDepth = 256 });
@@ -73,47 +58,34 @@ static string ToolSchemaToString(object tool)
     }
 }
 
-static string ToolName(object tool)
+static string ToolName(object tool) =>
+    GetProp(tool, "Name")?.ToString()
+    ?? GetProp(tool, "name")?.ToString()
+    ?? tool.GetType().Name;
+
+static string ToolDescription(object tool) =>
+    GetProp(tool, "Description")?.ToString()
+    ?? GetProp(tool, "description")?.ToString()
+    ?? "";
+
+static string BuildToolCatalogJson(IEnumerable<object> tools)
 {
-    return GetProp(tool, "Name")?.ToString()
-        ?? GetProp(tool, "name")?.ToString()
-        ?? tool.GetType().Name;
+    var compact = tools.Select(t => new
+    {
+        name = ToolName(t),
+        description = ToolDescription(t),
+        input_schema = ToolSchemaToString(t)
+    });
+    return JsonSerializer.Serialize(new { mcp_tools = compact }, new JsonSerializerOptions { WriteIndented = false, MaxDepth = 256 });
 }
 
-static string ToolDescription(object tool)
+static void DumpPayload(List<ChatMessage> messages, string filePath)
 {
-    return GetProp(tool, "Description")?.ToString()
-        ?? GetProp(tool, "description")?.ToString()
-        ?? "";
-}
-
-static void DumpPayload(
-    List<ChatMessage> messages,
-    IEnumerable<object> tools,
-    string filePath)
-{
-    // 僅輸出必要欄位，避免 dump 檔自己就過肥
     var dump = new
     {
-        Messages = messages.Select(m => new
-        {
-            Role = m.Role.ToString(),
-            Text = m.Text
-        }),
-        Tools = tools.Select(t => new
-        {
-            Name = ToolName(t),
-            Description = ToolDescription(t),
-            InputSchema = ToolSchemaToString(t)
-        })
+        Messages = messages.Select(m => new { Role = m.Role.ToString(), Text = m.Text })
     };
-
-    var json = JsonSerializer.Serialize(dump, new JsonSerializerOptions
-    {
-        WriteIndented = true,
-        MaxDepth = 256
-    });
-
+    var json = JsonSerializer.Serialize(dump, new JsonSerializerOptions { WriteIndented = true, MaxDepth = 256 });
     File.WriteAllText(filePath, json, Encoding.UTF8);
     Console.WriteLine($"[DEBUG] Payload dumped to {filePath}, bytes={Encoding.UTF8.GetByteCount(json)}");
 }
@@ -131,7 +103,9 @@ try
     IChatClient client = new ChatClientBuilder(
         baseClient.GetChatClient("gpt-4.1-mini").AsIChatClient()
     )
-    .UseFunctionInvocation() // 建議先關閉，避免自動掛入額外工具定義
+    // 這裡保留 UseFunctionInvocation，以便未來如要啟用工具可行；
+    // 但**本回合**我們不在 ChatOptions 傳遞 Tools，避免每回合帶入整包 schema。
+    .UseFunctionInvocation()
     .Build();
 
     // 2) 啟動 MCP Client（你的 CVE server）
@@ -143,19 +117,68 @@ try
             Name = "Minimal CVE MCP Server",
         }));
 
-    // 3) 取得 MCP 工具
-    Console.WriteLine("Available tools:");
+    // 3) 取得 MCP 工具，並「一次性」以 System 訊息同步給 LLM
+    Console.WriteLine("Available tools from MCP:");
     var allTools = await mcpClient.ListToolsAsync();
     foreach (var tool in allTools) Console.WriteLine(tool);
     Console.WriteLine();
 
-    // 若仍觸發 413，請改成只挑必要那支工具：
-    // var selectedTools = allTools.Where(t => ToolName(t) == "get_cve_records").Cast<object>().ToArray();
-    var selectedTools = allTools.ToArray();  // allTools 應該已經是 IList<AITool>
-
+    // 建立對話歷史，將工具清單以 System 訊息注入（僅作為知識，不是每回合傳 Tools 給 ChatOptions）
     var messages = new List<ChatMessage>();
     const int MaxHistory = 8;
 
+    string currentToolCatalogJson = BuildToolCatalogJson(allTools.Cast<object>());
+    var toolCatalogSystemText =
+        "You can call external MCP tools via the host. " +
+        "Here is the current tool catalog (names, descriptions, and JSON Schemas). " +
+        "If you intend to call a tool, respond with a clear tool name and JSON arguments instead of reprinting the schema.\n" +
+        currentToolCatalogJson;
+
+    // 保留此 System 訊息位置，後續若工具更新就替換
+    int toolCatalogSystemIndex = -1;
+    void UpsertToolCatalogSystemMessage(string catalogJson)
+    {
+        var text =
+            "You can call external MCP tools via the host. " +
+            "Here is the current tool catalog (names, descriptions, and JSON Schemas). " +
+            "If you intend to call a tool, respond with a clear tool name and JSON arguments instead of reprinting the schema.\n" +
+            catalogJson;
+
+        if (toolCatalogSystemIndex >= 0 && toolCatalogSystemIndex < messages.Count && messages[toolCatalogSystemIndex].Role == ChatRole.System)
+        {
+            messages[toolCatalogSystemIndex] = new(ChatRole.System, text);
+        }
+        else
+        {
+            messages.Insert(0, new(ChatRole.System, text));
+            toolCatalogSystemIndex = 0;
+        }
+    }
+    UpsertToolCatalogSystemMessage(currentToolCatalogJson);
+
+    // 4) 監聽 MCP 的工具更新通知，收到就重新同步 System 訊息（不在每回合傳 Tools）
+    //    方法名以 "tools/list_changed" 為範例，請依你的 Server 實際通知方法調整。
+    mcpClient.NotificationReceived += async (_, e) =>
+    {
+        try
+        {
+            if (string.Equals(e.Method, "tools/list_changed", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(e.Method, "tools/updated", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine("[MCP] Tools update notification received. Refreshing tool catalog...");
+                var refreshed = await mcpClient.ListToolsAsync();
+                currentToolCatalogJson = BuildToolCatalogJson(refreshed.Cast<object>());
+                UpsertToolCatalogSystemMessage(currentToolCatalogJson);
+                Console.WriteLine("[MCP] Tool catalog synced to LLM via System message.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[MCP] Failed to refresh tools after notification: " + ex.Message);
+        }
+    };
+
+    // 5) REPL：使用者輸入時，不要在 ChatOptions 帶 Tools（避免每次都傳大型 schema）
     while (true)
     {
         Console.Write("Prompt (:q 退出): ");
@@ -166,16 +189,17 @@ try
         messages.Add(new(ChatRole.User, input));
         TrimHistory(messages, MaxHistory);
 
+        // 僅傳 messages；不附帶 Tools
         var options = new ChatOptions
         {
-            Tools = selectedTools // 直接把 MCP 工具集合帶進去
+            // Tools = null // 預設即不帶，保留說明
         };
 
-        // 發送前 dump payload
+        // 發送前 dump（只 dump 訊息，避免工具清單巨量）
         var dumpPath = $"request_dump_{DateTime.Now:yyyyMMdd_HHmmss}.json";
-        DumpPayload(messages, selectedTools.Cast<object>(), dumpPath);
+        DumpPayload(messages, dumpPath);
 
-        // 4) 真正送 request
+        // 6) 串流回覆
         var updates = new List<ChatResponseUpdate>();
         await foreach (var update in client.GetStreamingResponseAsync(messages, options))
         {
